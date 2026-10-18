@@ -1,0 +1,134 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use utf8;
+use open qw(:std :utf8);
+use Encode qw(decode_utf8 encode_utf8);
+
+# The shell passes arguments as raw UTF-8 bytes. Decode them so the
+# query prints correctly, then encode again when handing them to diatheke.
+if (!(${^UNICODE} & 64)) {
+    @ARGV = map { decode_utf8($_) } @ARGV;
+}
+
+# Search a SWORD Bible module with diatheke and print the full text of
+# every matching verse. Phrase search itself only returns a reference list,
+# and it glues the first two references together, so this script parses the
+# list and looks the verses up.
+
+my $module = "FinRK";
+my $search_type = "phrase";
+my $range;
+my $maximum;
+
+sub usage {
+    die <<'EOF';
+Usage: bible-search [-b module] [-s type] [-r range] [-m max] search phrase
+
+  -b module   SWORD module (default: FinRK)
+  -s type     search type: phrase, regex, multiword (default: phrase)
+  -r range    limit the search, e.g. John or Mt-Jn
+  -m max      maximum number of hits to retrieve
+
+Examples:
+  bible-search älä pelkää
+  bible-search -r John iankaikkinen elämä
+  bible-search -b FinPR92 -s multiword armo usko
+EOF
+}
+
+while (@ARGV && $ARGV[0] =~ /^-/) {
+    my $opt = shift @ARGV;
+    last if $opt eq "--";
+    if ($opt eq "-b" && @ARGV) {
+        $module = shift @ARGV;
+    }
+    elsif ($opt eq "-s" && @ARGV) {
+        $search_type = shift @ARGV;
+    }
+    elsif ($opt eq "-r" && @ARGV) {
+        $range = shift @ARGV;
+    }
+    elsif ($opt eq "-m" && @ARGV) {
+        $maximum = shift @ARGV;
+        die "Maximum must be a positive integer.\n" unless $maximum =~ /^\d+$/ && $maximum > 0;
+    }
+    elsif ($opt eq "-h" || $opt eq "--help") {
+        usage();
+    }
+    else {
+        usage();
+    }
+}
+
+usage() unless @ARGV;
+my $query = join " ", @ARGV;
+
+my @search_cmd = ("diatheke", "-b", $module, "-s", $search_type);
+push @search_cmd, "-r", $range if defined $range;
+push @search_cmd, "-m", $maximum if defined $maximum;
+push @search_cmd, "-k", $query;
+
+my $search = capture(@search_cmd);
+if (!defined $search || $search =~ /^\s*$/) {
+    die "diatheke returned nothing. Is module '$module' installed?\n";
+}
+
+if ($search =~ /--\s*none\s*\(/) {
+    print "No matches in $module for \"$query\".\n";
+    exit 0;
+}
+
+my ($count) = $search =~ /(\d+)\s+matches/;
+my $list = $search;
+$list =~ s/^.*?--\s*//s;
+$list =~ s/\s*--\s*\d+\s+matches.*//s;
+
+# Book, optional roman numeral, optional "of Name", then chapter:verse.
+my $ref_re = qr/
+    (?: (?:I{1,3}|IV) \s+ )?
+    [A-Z][A-Za-z]+
+    (?: \s+ (?:of \s+)? [A-Z][A-Za-z]+ )*
+    \s+
+    \d+ : \d+
+    (?: - \d+ )?
+/x;
+
+my @refs = $list =~ /$ref_re/g;
+if (!@refs) {
+    die "Could not find verse references in diatheke output:\n$search";
+}
+if (defined $count && @refs != $count) {
+    warn "Parsed ", scalar(@refs), " references; diatheke reported $count.\n";
+}
+
+my $found = defined $count ? $count : scalar @refs;
+print "$found ", ($found == 1 ? "verse" : "verses"), " in $module for \"$query\":\n\n";
+
+my $batch_size = 40;
+for (my $i = 0; $i < @refs; $i += $batch_size) {
+    my $last = $i + $batch_size - 1;
+    $last = $#refs if $last > $#refs;
+    my $key = join ";", @refs[$i .. $last];
+    my $text = capture("diatheke", "-b", $module, "-f", "plain", "-k", $key);
+    die "Verse lookup failed for $module.\n" if !defined $text || $text =~ /^\s*$/;
+
+    for my $line (split /\n/, $text) {
+        next if $line =~ /^\s*$/;
+        next if $line =~ /^\(\Q$module\E\)\s*$/;
+        print "$line\n";
+    }
+}
+
+sub capture {
+    my @cmd = map { encode_utf8($_) } @_;
+    open my $fh, "-|", @cmd or die "Could not run $cmd[0]: $!\n";
+    local $/;
+    my $output = <$fh>;
+    close $fh;
+    if ($?) {
+        my $code = $? >> 8;
+        die "$cmd[0] exited with status $code.\n";
+    }
+    return $output;
+}
